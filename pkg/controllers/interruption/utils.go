@@ -119,9 +119,10 @@ func (h *InterruptionHandler) handleNodeClaim(ctx context.Context, msg messages.
 		if err := h.annotateTerminationTimestamp(ctx, nodeClaim); err != nil {
 			return err
 		}
-		return h.deleteNodeClaim(ctx, msg, nodeClaim, node)
+		// The termination timestamp is now or earlier, so this is forceful whatever the NodeClaim's terminationGracePeriod.
+		return h.deleteNodeClaim(ctx, msg, nodeClaim, node, metrics.TerminationModeForceful)
 	case CordonAndDrain:
-		return h.deleteNodeClaim(ctx, msg, nodeClaim, node)
+		return h.deleteNodeClaim(ctx, msg, nodeClaim, node, nodeclaimutils.DisruptionTerminationMode(nodeClaim))
 	default:
 		return nil
 	}
@@ -154,7 +155,7 @@ func (h *InterruptionHandler) markUnavailableOfferings(ctx context.Context, msg 
 }
 
 // deleteNodeClaim removes the NodeClaim from the api-server
-func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.Message, nodeClaim *karpv1.NodeClaim, node *corev1.Node) error {
+func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.Message, nodeClaim *karpv1.NodeClaim, node *corev1.Node, terminationMode string) error {
 	if !nodeClaim.DeletionTimestamp.IsZero() {
 		return nil
 	}
@@ -170,7 +171,7 @@ func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.
 		// Interruption isn't consolidation, so there's no consolidation policy to report - the same as the
 		// core health controller reports when it deletes an unhealthy node.
 		metrics.ConsolidationPolicyLabel: "",
-		metrics.TerminationModeLabel:     nodeclaimutils.DisruptionTerminationMode(nodeClaim),
+		metrics.TerminationModeLabel:     terminationMode,
 	})
 	return nil
 }
@@ -180,8 +181,11 @@ func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.
 // eviction) and volume detachment waits. This is used for instance health failures where the
 // instance is already broken and graceful drain may not be possible.
 func (h *InterruptionHandler) annotateTerminationTimestamp(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
-	if _, exists := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; exists {
-		return nil
+	if value, exists := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; exists {
+		// Keep only a valid timestamp that is now or earlier, since a later or invalid one would delay or block the termination.
+		if timestamp, err := time.Parse(time.RFC3339, value); err == nil && !timestamp.After(h.clk.Now()) {
+			return nil
+		}
 	}
 	stored := nodeClaim.DeepCopy()
 	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{

@@ -141,8 +141,9 @@ var _ = Describe("InterruptionHandling", func() {
 
 			ExpectSingletonReconciled(ctx, controller)
 			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel: "spot_interrupted",
-				"nodepool":          "default",
+				metrics.ReasonLabel:          "spot_interrupted",
+				"nodepool":                   "default",
+				metrics.TerminationModeLabel: metrics.TerminationModeGraceful,
 			})
 			Expect(sqsapi.ReceiveMessageBehavior.SuccessfulCalls()).To(Equal(1))
 			ExpectNotFound(ctx, env.Client, nodeClaim)
@@ -359,8 +360,9 @@ var _ = Describe("InterruptionHandling", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
 			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel: "system_status",
-				"nodepool":          "default",
+				metrics.ReasonLabel:          "system_status",
+				"nodepool":                   "default",
+				metrics.TerminationModeLabel: metrics.TerminationModeForceful,
 			})
 			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
 				"category": "SystemStatus",
@@ -390,13 +392,24 @@ var _ = Describe("InterruptionHandling", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
 			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel: "instance_status",
-				"nodepool":          "default",
+				metrics.ReasonLabel:          "instance_status",
+				"nodepool":                   "default",
+				metrics.TerminationModeLabel: metrics.TerminationModeForceful,
 			})
 			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
 			ExpectNotFound(ctx, env.Client, nodeClaim)
+		})
+		It("should count a spot interruption with the NodeClaim's own termination mode", func() {
+			nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: time.Hour}
+			ExpectMessagesCreated(spotInterruptionMessage(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))))
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectSingletonReconciled(ctx, controller)
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel:          "spot_interrupted",
+				metrics.TerminationModeLabel: metrics.TerminationModeEventual,
+			})
 		})
 		// TODO(kubernetes-sigs/karpenter#3029): These tests verify the termination timestamp
 		// annotation as a proxy for forceful termination behavior. Once the forceful termination
@@ -514,12 +527,53 @@ var _ = Describe("InterruptionHandling", func() {
 			originalTimestamp := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]
 			originalResourceVersion := nodeClaim.ResourceVersion
 
-			// Second reconcile should no-op (NodeClaim already has DeletionTimestamp)
+			// Second reconcile a minute later should no-op, since the timestamp has passed and the NodeClaim is already deleting
+			awsEnv.Clock.Step(time.Minute)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]).To(Equal(originalTimestamp))
 			Expect(nodeClaim.ResourceVersion).To(Equal(originalResourceVersion))
 		})
+		DescribeTable("should replace a later or invalid termination timestamp for forceful termination",
+			func(timestamp func() string) {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
+				nodeClaim.Finalizers = []string{"testing/finalizer"}
+				nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: time.Hour}
+				awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
+					InstanceStatuses: []ec2types.InstanceStatus{
+						{
+							InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
+							SystemStatus: &ec2types.InstanceStatusSummary{
+								Status: ec2types.SummaryStatusImpaired,
+								Details: []ec2types.InstanceStatusDetails{
+									{
+										Status:        ec2types.StatusTypeFailed,
+										Name:          ec2types.StatusNameReachability,
+										ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
+									},
+								},
+							},
+						},
+					},
+				})
+				awsEnv.Clock.Step(time.Hour)
+				nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+					karpv1.NodeClaimTerminationTimestampAnnotationKey: timestamp(),
+				})
+				ExpectApplied(ctx, env.Client, nodeClaim, node)
+				ExpectSingletonReconciled(ctx, instanceStatusController)
+				// NodeClaim should still exist due to finalizer, but have a DeletionTimestamp
+				nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+				Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeFalse())
+				Expect(nodeClaim.Annotations).To(HaveKeyWithValue(karpv1.NodeClaimTerminationTimestampAnnotationKey, awsEnv.Clock.Now().Format(time.RFC3339)))
+				ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+					metrics.ReasonLabel:          "system_status",
+					metrics.TerminationModeLabel: metrics.TerminationModeForceful,
+				})
+			},
+			Entry("with a later timestamp", func() string { return awsEnv.Clock.Now().Add(time.Hour).Format(time.RFC3339) }),
+			Entry("with an invalid timestamp", func() string { return "invalid" }),
+		)
 		It("should not terminate the NodeClaim before a status check failure exceeds the unhealthy threshold", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
 			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
